@@ -47,3 +47,28 @@ services:
          read only = no
          browseable = yes
          force group = staff
+  samba-smb3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samba-smb3
+    ports:
+      - "4446:445"
+    environment:
+      AVAHI_DISABLE: 1
+      SAMBA_CONF_LOG_LEVEL: 3
+
+      SAMBA_GLOBAL_CONFIG_server_SPACE_min_SPACE_protocol: SMB3_11
+      SAMBA_GLOBAL_CONFIG_server_SPACE_smb_SPACE_encrypt: required
+      SAMBA_CONF_MAP_TO_GUEST: Never
+
+      ACCOUNT_alice: alipass
+      UID_alice: 1000
+
+      SAMBA_VOLUME_CONFIG_encrypted: |
+        [Encrypted]
+         path = /shares/alice
+         valid users = alice
+         guest ok = no
+         read only = no
+         browseable = yes

@@ -8,7 +8,7 @@ final class SessionTests: XCTestCase {
     try await session.connect()
 
     let response = try await session.negotiate()
-    XCTAssertEqual(response.dialectRevision , Negotiate.Dialects.smb210.rawValue)
+    XCTAssertEqual(response.dialectRevision , Negotiate.Dialects.smb311.rawValue)
   }
 
   func testSessionSetup01() async throws {

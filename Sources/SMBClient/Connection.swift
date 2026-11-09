@@ -9,6 +9,16 @@ public class Connection {
   private let queue: DispatchQueue
   private var buffer = Data()
 
+  /// Set once an SMB 3.x session is set up, so encrypted responses
+  /// (transform headers) can be opened.
+  var secureChannel: SecureChannel?
+
+  private func open(_ message: Data) throws -> Data {
+    guard SecureChannel.isTransform(message) else { return message }
+    guard let secureChannel else { throw SecureChannel.TransformError.unsupportedCipher }
+    return try secureChannel.decrypt(message)
+  }
+
   private let semaphore = Semaphore(value: 1)
 
   public var state: NWConnection.State {
@@ -166,7 +176,13 @@ public class Connection {
         self.receive(upTo: length) { (result) in
           switch result {
           case .success:
-            let data = Data(self.buffer.prefix(length))
+            let data: Data
+            do {
+              data = try self.open(Data(self.buffer.prefix(length)))
+            } catch {
+              completion(.failure(error))
+              return
+            }
             self.buffer = Data(self.buffer.suffix(from: length))
 
             let reader = ByteReader(data)
@@ -194,7 +210,13 @@ public class Connection {
                     return
                   }
 
-                  let data = transportPacket.smb2Message
+                  let data: Data
+                  do {
+                    data = try self.open(Data(transportPacket.smb2Message.prefix(length)))
+                  } catch {
+                    completion(.failure(error))
+                    return
+                  }
                   self.buffer = Data(self.buffer.suffix(from: 4 + length))
 
                   let reader = ByteReader(data)

@@ -9,6 +9,37 @@ public class Session {
   private var signingRequired = false
   private var signingKey: Data?
 
+  /// The dialect the server chose (0 before `negotiate`).
+  public private(set) var dialect: UInt16 = 0
+  private var serverCapabilities: Negotiate.Capabilities = []
+  private var negotiatedContexts: NegotiateContext.Selection?
+  /// SMB 3.1.1 pre-authentication integrity hash: the connection's after
+  /// negotiate, then the session's during session setup.
+  private var preauthHash = Data(count: 64)
+  private var secureChannel: SecureChannel?
+  /// The server asked for the whole session to be encrypted.
+  private var sessionEncrypts = false
+  /// The connected share asked to be encrypted.
+  private var treeEncrypts = false
+
+  /// Encrypt even when the server doesn't ask to, if it supports SMB 3
+  /// encryption (the client's `Session.EncryptData`, [MS-SMB2] 3.2.4.1.8).
+  /// Set before `treeConnect`; sessions made for other shares inherit it.
+  public var prefersEncryption = false
+
+  /// Whether requests on this session go out encrypted (SMB 3.x).
+  public var isEncrypting: Bool {
+    (sessionEncrypts || treeEncrypts || prefersEncryption) && secureChannel?.canEncrypt == true
+  }
+  /// Whether requests on this session are signed.
+  public var isSigning: Bool { signingKey != nil && signingRequired && !isAnonymous }
+  /// The cipher used when encrypting, if the session can.
+  public var cipher: NegotiateContext.Cipher? { secureChannel?.cipher }
+  /// The signing algorithm in use.
+  public var signingAlgorithm: NegotiateContext.SigningAlgorithm {
+    secureChannel?.signingAlgorithm ?? .hmacSHA256
+  }
+
   public private(set) var maxTransactSize: UInt32 = 0
   public private(set) var maxReadSize: UInt32 = 0
   public private(set) var maxWriteSize: UInt32 = 0
@@ -46,6 +77,13 @@ public class Session {
 
     session.signingRequired = signingRequired
     session.signingKey = signingKey
+    session.isAnonymous = isAnonymous
+    session.dialect = dialect
+    session.serverCapabilities = serverCapabilities
+    session.negotiatedContexts = negotiatedContexts
+    session.secureChannel = secureChannel
+    session.sessionEncrypts = sessionEncrypts
+    session.prefersEncryption = prefersEncryption
 
     session.maxTransactSize = maxTransactSize
     session.maxReadSize = maxReadSize
@@ -69,15 +107,27 @@ public class Session {
   @discardableResult
   public func negotiate(
     securityMode: Negotiate.SecurityMode = [.signingEnabled],
-    dialects: [Negotiate.Dialects] = [.smb202, .smb210]
+    dialects: [Negotiate.Dialects] = [.smb202, .smb210, .smb300, .smb302, .smb311],
+    contexts: NegotiateContext.Offer? = nil
   ) async throws -> Negotiate.Response {
     let request = Negotiate.Request(
       messageId: messageId.next(),
       securityMode: securityMode,
-      dialects: dialects
+      dialects: dialects,
+      contexts: contexts
     )
 
-    let response = try await send(request)
+    let requestData = request.encoded()
+    let responseData = try await connection.send(requestData)
+    let response = Negotiate.Response(data: responseData)
+
+    dialect = response.dialectRevision
+    serverCapabilities = response.capabilities
+    negotiatedContexts = response.negotiateContexts
+    if dialect == Negotiate.Dialects.smb311.rawValue {
+      preauthHash = SMB3Crypto.sha512(Data(count: 64) + requestData)
+      preauthHash = SMB3Crypto.sha512(preauthHash + responseData)
+    }
 
     signingRequired = response.securityMode.contains(.signingRequired) || (securityMode.contains(.signingRequired) && response.securityMode.contains(.signingEnabled))
 
@@ -110,9 +160,20 @@ public class Session {
       previousSessionId: 0,
       securityBuffer: securityBuffer
     )
-    let response = try await send(request)
+    let is311 = dialect == Negotiate.Dialects.smb311.rawValue
+    var hash = preauthHash
+    let requestData = request.encoded()
+    let responseData = try await connection.send(requestData)
+    let response = SessionSetup.Response(data: responseData)
+    if is311 {
+      hash = SMB3Crypto.sha512(hash + requestData)
+    }
 
     if NTStatus(response.header.status) == .moreProcessingRequired {
+      if is311 {
+        hash = SMB3Crypto.sha512(hash + responseData)
+      }
+
       let challengeMessage = NTLM.ChallengeMessage(data: response.buffer)
 
       let signingKey = Crypto.randomBytes(count: 16)
@@ -134,12 +195,32 @@ public class Session {
         securityBuffer: authenticateMessage.encoded()
       )
 
-      let response = try await send(request)
+      let finalRequestData = request.encoded()
+      if is311 {
+        hash = SMB3Crypto.sha512(hash + finalRequestData)
+      }
+      let response = SessionSetup.Response(data: try await connection.send(finalRequestData))
 
       sessionId = response.header.sessionId
 
-      isAnonymous = (username ?? "").isEmpty && (password ?? "").isEmpty
+      isAnonymous = ((username ?? "").isEmpty && (password ?? "").isEmpty)
+        || response.sessionFlags.contains(.guest)
+        || response.sessionFlags.contains(.nullSession)
       self.signingKey = signingKey
+
+      if !isAnonymous {
+        secureChannel = SecureChannel(
+          dialect: dialect,
+          sessionId: sessionId,
+          sessionKey: signingKey,
+          preauthHash: is311 ? hash : nil,
+          negotiatedCipher: negotiatedContexts?.cipher,
+          negotiatedSigning: negotiatedContexts?.signingAlgorithm,
+          serverSupportsEncryption: serverCapabilities.contains(.encryption)
+        )
+        sessionEncrypts = response.sessionFlags.contains(.encryptData)
+        connection.secureChannel = secureChannel
+      }
 
       return response
     } else {
@@ -211,6 +292,7 @@ public class Session {
 
     treeId = response.header.treeId
     connectedTree = path
+    treeEncrypts = response.shareFlags.contains(.encryptData)
 
     return response
   }
@@ -227,6 +309,7 @@ public class Session {
 
     treeId = 0
     connectedTree = nil
+    treeEncrypts = false
 
     return response
   }
@@ -692,7 +775,7 @@ public class Session {
 
   private func send<Request: Message.Request>(_ message: Request) async throws -> Request.Response {
     let packet = message.encoded()
-    let data = try await connection.send(sign(packet))
+    let data = try await connection.send(seal(sign(packet)))
     let response = Request.Response(data: data)
     return response
   }
@@ -724,7 +807,7 @@ public class Session {
       index += 1
     }
 
-    let responseData = try await connection.send(packet)
+    let responseData = try await connection.send(seal(packet))
     let reader = ByteReader(responseData)
 
     var responses = [Data]()
@@ -767,7 +850,7 @@ public class Session {
   }
 
   private func send(_ packets: Data...) async throws -> Data {
-    return try await connection.send(
+    return try await connection.send(seal(
       packets.enumerated().reduce(into: Data()) {
         let alignment = Data(count: 8 - $1.element.count % 8)
         if $1.offset < packets.count - 1 {
@@ -782,24 +865,37 @@ public class Session {
           $0 += sign($1.element + alignment)
         }
       }
-    )
+    ))
   }
 #endif
 
   private func sign(_ packet: Data) -> Data {
-    if let signingKey, signingRequired, !isAnonymous {
-      var header = Header(data: packet[..<64])
-      let payload = packet[64...]
+    // An encrypted message isn't signed: the transform authenticates it.
+    guard let signingKey, !isAnonymous, !isEncrypting else { return packet }
 
-      header.flags = header.flags.union(.signed)
+    var header = Header(data: packet[..<64])
+    // SMB 3.1.1 clients sign TREE_CONNECT even when signing isn't required,
+    // which protects the negotiate ([MS-SMB2] 3.2.4.1.1).
+    let mustSign = signingRequired
+      || (dialect == Negotiate.Dialects.smb311.rawValue && header.command == Header.Command.treeConnect.rawValue)
+    guard mustSign else { return packet }
 
-      let signature = Crypto.hmacSHA256(key: signingKey, data: header.encoded() + payload)[..<16]
-      header.signature = signature
+    let payload = packet[64...]
+    header.flags = header.flags.union(.signed)
+    header.signature = Data(count: 16)
 
-      return header.encoded() + payload
+    if let secureChannel {
+      header.signature = secureChannel.signature(of: header.encoded() + payload)
     } else {
-      return packet
+      header.signature = Crypto.hmacSHA256(key: signingKey, data: header.encoded() + payload)[..<16]
     }
+
+    return header.encoded() + payload
+  }
+
+  private func seal(_ packet: Data) throws -> Data {
+    guard isEncrypting, let secureChannel else { return packet }
+    return try secureChannel.encrypt(packet)
   }
 }
 

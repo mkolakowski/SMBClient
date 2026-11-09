@@ -20,7 +20,9 @@ public enum Negotiate {
       headerFlags: Header.Flags = [],
       messageId: UInt64,
       securityMode: SecurityMode,
-      dialects: [Dialects]
+      dialects: [Dialects],
+      capabilities: Capabilities? = nil,
+      contexts: NegotiateContext.Offer? = nil
     ) {
       header = Header(
         creditCharge: 1,
@@ -36,12 +38,26 @@ public enum Negotiate {
       dialectCount = UInt16(dialects.count)
       self.securityMode = securityMode
       reserved = 0
-      capabilities = []
+      let offersSMB3 = dialects.contains { $0.rawValue >= Dialects.smb300.rawValue }
+      self.capabilities = capabilities ?? (offersSMB3 ? [.encryption] : [])
       clientGuid = UUID()
-      clientStartTime = 0
       self.dialects = dialects
-      padding = Data(count: (dialects.count * 2) % 8)
-      negotiateContextList = Data()
+
+      if dialects.contains(.smb311) {
+        // In 3.1.1 ClientStartTime becomes NegotiateContextOffset (4),
+        // NegotiateContextCount (2) and Reserved2 (2). The list starts on an
+        // 8-byte boundary after the dialects (header 64 + fixed part 36).
+        let (list, count) = (contexts ?? NegotiateContext.Offer()).encoded()
+        let dialectsEnd = 64 + 36 + dialects.count * 2
+        let offset = (dialectsEnd + 7) / 8 * 8
+        clientStartTime = UInt64(offset) | UInt64(count) << 32
+        padding = Data(count: offset - dialectsEnd)
+        negotiateContextList = list
+      } else {
+        clientStartTime = 0
+        padding = Data(count: (dialects.count * 2) % 8)
+        negotiateContextList = Data()
+      }
     }
 
     public func encoded() -> Data {
@@ -84,6 +100,8 @@ public enum Negotiate {
     public let securityBufferLength: UInt16
     public let negotiateContextOffset: UInt32
     public let securityBuffer: Data
+    /// The cipher and signing algorithm the server chose (SMB 3.1.1 only).
+    public let negotiateContexts: NegotiateContext.Selection?
 
     public init(data: Data) {
       let reader = ByteReader(data)
@@ -105,6 +123,9 @@ public enum Negotiate {
       securityBufferLength = reader.read()
       negotiateContextOffset = reader.read()
       securityBuffer = reader.read(from: Int(securityBufferOffset), count: Int(securityBufferLength))
+      negotiateContexts = dialectRevision == Dialects.smb311.rawValue && negotiateContextCount > 0
+        ? NegotiateContext.Selection(message: data, offset: Int(negotiateContextOffset), count: Int(negotiateContextCount))
+        : nil
     }
   }
 
@@ -136,7 +157,7 @@ public enum Negotiate {
     public static let notifications = Capabilities(rawValue: 0x00000080)
   }
 
-  public enum Dialects: UInt16 {
+  public enum Dialects: UInt16, Sendable {
     case smb202 = 0x0202
     case smb210 = 0x0210
     case smb300 = 0x0300
