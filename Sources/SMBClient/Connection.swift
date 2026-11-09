@@ -21,6 +21,62 @@ public class Connection {
 
   private let semaphore = Semaphore(value: 1)
 
+  // MARK: Giving up on a server that's gone quiet
+
+  /// How long a reply may go quiet before the request gives up: the clock
+  /// restarts whenever bytes arrive, so a slow but steady reply finishes.
+  /// `nil` waits as long as TCP does (a server that vanishes without closing
+  /// the connection can take many minutes).
+  public var responseTimeout: TimeInterval? = 30
+  /// After the server answers STATUS_PENDING (it's working on it), how long
+  /// the final reply may take.
+  public var pendingTimeout: TimeInterval? = 300
+  /// How long connecting may take.
+  public var connectTimeout: TimeInterval? = 10
+  /// The slowest a request may go out, in bytes a second: a send of n bytes
+  /// gets n / this on top of `responseTimeout` before it's given up on.
+  public var minimumSendRate: Double = 32 * 1024
+
+  /// The running clock; when it runs out the connection is cancelled, which
+  /// fails whatever is waiting on it. Only touched on `queue`.
+  private var deadline: DispatchWorkItem?
+  /// How long the reply may go quiet just now (`responseTimeout`, or
+  /// `pendingTimeout` after STATUS_PENDING). Only touched on `queue`.
+  private var quietLimit: TimeInterval?
+  /// Set when a clock ran out, so the error says so. Only touched on `queue`.
+  private var didTimeOut = false
+
+  /// Starts the clock afresh. On `queue`.
+  private func arm(_ seconds: TimeInterval?) {
+    deadline?.cancel()
+    deadline = nil
+    guard let seconds else { return }
+    let item = DispatchWorkItem { [weak self] in
+      guard let self, self.deadline != nil else { return }
+      self.deadline = nil
+      self.didTimeOut = true
+      self.connection.cancel()
+    }
+    deadline = item
+    queue.asyncAfter(deadline: .now() + seconds, execute: item)
+  }
+
+  /// Bytes arrived: the reply isn't quiet. On `queue`.
+  private func noteActivity() {
+    if deadline != nil { arm(quietLimit) }
+  }
+
+  /// The request's over, one way or the other. On `queue`.
+  private func disarm() {
+    deadline?.cancel()
+    deadline = nil
+  }
+
+  /// `error`, or `ConnectionError.timedOut` when a clock ran out. On `queue`.
+  private func reported(_ error: Error) -> Error {
+    didTimeOut ? ConnectionError.timedOut : error
+  }
+
   public var state: NWConnection.State {
     connection.state
   }
@@ -49,15 +105,18 @@ public class Connection {
   }
 
   public func connect() async throws {
+    let limit = connectTimeout
     return try await withCheckedThrowingContinuation { (continuation) in
       connection.stateUpdateHandler = { [weak self] (state) in
         switch state {
         case .setup, .preparing:
           break
         case .waiting(let error):
+          self?.disarm()
           continuation.resume(throwing: error)
           self?.connection.stateUpdateHandler = nil
         case .ready:
+          self?.disarm()
           continuation.resume()
           // NWConnection delivers all state updates on `queue`, so assigning
           // stateUpdateHandler here is safe: it runs on the same serial queue
@@ -73,16 +132,21 @@ public class Connection {
             }
           }
         case .failed(let error):
+          self?.disarm()
           continuation.resume(throwing: error)
           self?.connection.stateUpdateHandler = nil
         case .cancelled:
-          continuation.resume(throwing: ConnectionError.cancelled)
+          let timedOut = self?.didTimeOut ?? false
+          self?.disarm()
+          continuation.resume(throwing: timedOut ? ConnectionError.timedOut : ConnectionError.cancelled)
           self?.connection.stateUpdateHandler = nil
         @unknown default:
           break
         }
       }
 
+      // On `queue` before the first state update can arrive.
+      queue.async { self.arm(limit) }
       connection.start(queue: queue)
     }
   }
@@ -116,24 +180,46 @@ public class Connection {
 
     let transportPacket = DirectTCPPacket(smb2Message: data)
     let content = transportPacket.encoded()
+    let replyLimit = responseTimeout
+    let sendLimit = replyLimit.map { $0 + Double(content.count) / max(minimumSendRate, 1) }
+    let pendingLimit = pendingTimeout
 
     return try await withCheckedThrowingContinuation { (continuation) in
+      // Enqueued before the send, so it runs before the send's completion.
+      queue.async {
+        self.quietLimit = replyLimit
+        self.pendingQuietLimit = pendingLimit
+        self.arm(sendLimit)
+      }
       connection.send(content: content, completion: .contentProcessed() { (error) in
         if let error {
-          continuation.resume(throwing: error)
+          self.disarm()
+          continuation.resume(throwing: self.reported(error))
           return
         }
 
+        // Sent: from here the reply mustn't go quiet for too long.
+        if self.deadline != nil { self.arm(self.quietLimit) }
         self.receive() { (result) in
+          self.disarm()
           switch result {
           case .success(let data):
             continuation.resume(returning: data)
           case .failure(let error):
-            continuation.resume(throwing: error)
+            continuation.resume(throwing: self.reported(error))
           }
         }
       })
     }
+  }
+
+  /// `pendingTimeout` as it was when the request went out. Only touched on `queue`.
+  private var pendingQuietLimit: TimeInterval?
+
+  /// The server answered STATUS_PENDING: give the final reply longer. On `queue`.
+  private func notePending() {
+    quietLimit = pendingQuietLimit
+    noteActivity()
   }
 
   private func receive(completion: @escaping (Result<Data, Error>) -> Void) {
@@ -159,6 +245,7 @@ public class Connection {
       }
 
       self.buffer.append(Data(content))
+      self.noteActivity()
 
       self.receive(upTo: 4) { (headerResult) in
         switch headerResult {
@@ -201,6 +288,7 @@ public class Connection {
                 .endOfFile:
                 response += data
               case .pending:
+                self.notePending()
                 if self.buffer.count >= 4 {
                   let transportPacket = DirectTCPPacket(response: self.buffer)
                   let length = Int(transportPacket.protocolLength)
@@ -277,6 +365,7 @@ public class Connection {
         }
 
         self.buffer.append(data)
+        self.noteActivity()
         self.receive(upTo: byteCount, completion: completion)
       }
       return
@@ -290,4 +379,8 @@ public enum ConnectionError: Error {
   case disconnected
   case cancelled
   case unknown
+  /// The server didn't answer in time (`Connection.responseTimeout`,
+  /// `pendingTimeout`, `connectTimeout`, `minimumSendRate`); the connection
+  /// was closed.
+  case timedOut
 }
