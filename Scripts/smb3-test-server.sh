@@ -53,6 +53,15 @@ $3
   path = $BASE/share
   read only = no
   valid users = $(id -un)
+  # Without these, Samba on macOS makes folders with no permissions at all
+  # (d---------: it maps an empty NT ACL or DOS attributes onto the mode),
+  # so nothing can go in them or remove them.
+  force create mode = 0644
+  force directory mode = 0755
+  nt acl support = no
+  store dos attributes = no
+  ea support = no
+  map archive = no
 CONF
   printf 'testpass\ntestpass\n' | "$PREFIX/bin/pdbedit" -s "$dir/smb.conf" -a -u "$(id -un)" -t >/dev/null 2>&1
   nohup "$SMBD" -s "$dir/smb.conf" -F --debug-stdout -d 1 > "$dir/smbd.out" 2>&1 &

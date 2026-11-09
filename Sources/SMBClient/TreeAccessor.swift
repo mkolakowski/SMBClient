@@ -3,6 +3,8 @@ import Foundation
 public class TreeAccessor {
   public let share: String
   private let session: Session
+  private let connectLock = NSLock()
+  private var connecting: Task<Void, Error>?
 
   init(session: Session, share: String) {
     self.session = session.newSession()
@@ -111,8 +113,70 @@ public class TreeAccessor {
     FileReader(session: try await session(), path: Pathname.normalize(path))
   }
 
-  public func fileWriter(path: String) async throws -> FileWriter {
-    FileWriter(session: try await session(), path: Pathname.normalize(path))
+  public func fileWriter(path: String, overwrite: Bool = false) async throws -> FileWriter {
+    FileWriter(session: try await session(), path: Pathname.normalize(path), overwrite: overwrite)
+  }
+
+  /// Copies the file `source` to `destination` (not there yet) on the
+  /// server itself, with FSCTL_SRV_COPYCHUNK: nothing comes down to the
+  /// device. `progressHandler` gets the bytes copied and the total, and
+  /// returns whether to go on. If it fails or is stopped, the half-made
+  /// `destination` is removed. Throws `ErrorResponse` with
+  /// `.notSupported` or `.invalidDeviceRequest` from a server that can't.
+  public func copyFile(
+    from source: String,
+    to destination: String,
+    progressHandler: (_ bytesCopied: UInt64, _ totalBytes: UInt64) -> Bool = { _, _ in true }
+  ) async throws {
+    let session = try await session()
+    let target = Pathname.normalize(destination.precomposedStringWithCanonicalMapping)
+    let from = try await session.create(
+      desiredAccess: [.readData, .readAttributes],
+      fileAttributes: [],
+      shareAccess: [.read],
+      createDisposition: .open,
+      createOptions: [.nonDirectoryFile],
+      name: Pathname.normalize(source)
+    )
+    let to: Create.Response
+    do {
+      to = try await session.create(
+        desiredAccess: [.readData, .writeData, .appendData, .readAttributes, .writeAttributes],
+        fileAttributes: [.archive],
+        shareAccess: [.read],
+        createDisposition: .create,
+        createOptions: [.nonDirectoryFile],
+        name: target
+      )
+    } catch {
+      _ = try? await session.close(fileId: from.fileId)
+      throw error
+    }
+    do {
+      let key = try await session.requestResumeKey(fileId: from.fileId)
+      let total = from.endOfFile
+      var copied: UInt64 = 0
+      while copied < total {
+        var chunks: [CopyChunk] = []
+        var offset = copied
+        while chunks.count < CopyChunk.maxChunksPerRequest && offset < total {
+          let length = UInt32(min(UInt64(CopyChunk.maxChunkSize), total - offset))
+          chunks.append(CopyChunk(sourceOffset: offset, targetOffset: offset, length: length))
+          offset += UInt64(length)
+        }
+        let written = try await session.copyChunk(fileId: to.fileId, sourceKey: key, chunks: chunks)
+        guard written > 0 else { throw CopyChunk.Error.noProgress }
+        copied += UInt64(written)
+        guard progressHandler(copied, total) else { throw CancellationError() }
+      }
+      _ = try? await session.close(fileId: to.fileId)
+      _ = try? await session.close(fileId: from.fileId)
+    } catch {
+      _ = try? await session.close(fileId: to.fileId)
+      _ = try? await session.close(fileId: from.fileId)
+      try? await session.deleteFile(path: target)
+      throw error
+    }
   }
 
   public func availableSpace() async throws -> UInt64 {
@@ -133,10 +197,21 @@ public class TreeAccessor {
     try await session().echo()
   }
 
+  /// The share connected once, however many tasks ask at the same time:
+  /// two tree connects would leave files opened on the first one used on
+  /// the second (STATUS_FILE_CLOSED).
   func session() async throws -> Session {
-    if session.treeId == 0 {
-      try await session.treeConnect(path: share)
+    if session.treeId != 0 { return session }
+    let connecting = connectLock.withLock {
+      if let task = self.connecting { return task }
+      let session = self.session
+      let share = self.share
+      let task = Task { _ = try await session.treeConnect(path: share) }
+      self.connecting = task
+      return task
     }
+    defer { connectLock.withLock { self.connecting = nil } }
+    try await connecting.value
     return session
   }
 }

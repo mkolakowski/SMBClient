@@ -5,10 +5,27 @@ public class FileWriter {
   private let path: String
 
   private var createResponse: Create.Response?
+  /// Replace a file already at `path` rather than fail.
+  private let overwrite: Bool
 
-  init(session: Session, path: String) {
+  init(session: Session, path: String, overwrite: Bool = false) {
     self.session = session
     self.path = path.precomposedStringWithCanonicalMapping
+    self.overwrite = overwrite
+  }
+
+  /// Writes `data` at `offset`, in pieces of the server's largest write.
+  /// Call it once per piece of a big file, so the caller can report
+  /// progress and stop between them.
+  public func write(data: Data, offset: UInt64) async throws {
+    let fileProxy = try await fileProxy()
+    var written = 0
+    while written < data.count {
+      let end = min(written + Int(session.maxWriteSize), data.count)
+      let piece = data.subdata(in: (data.startIndex + written)..<(data.startIndex + end))
+      _ = try await session.write(data: piece, fileId: fileProxy.id, offset: offset + UInt64(written))
+      written = end
+    }
   }
 
   public func upload(data: Data) async throws {
@@ -183,7 +200,7 @@ public class FileWriter {
         ],
         fileAttributes: [.archive, .normal],
         shareAccess: [.read, .write, .delete],
-        createDisposition: .create,
+        createDisposition: overwrite ? .overwriteIf : .create,
         createOptions: [],
         name: path
       )

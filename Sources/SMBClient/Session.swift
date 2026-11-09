@@ -773,6 +773,57 @@ public class Session {
     return try await send(request)
   }
 
+  /// FSCTL_SRV_REQUEST_RESUME_KEY: the key naming the open file `fileId`
+  /// as the source of a server-side copy ([MS-SMB2] 2.2.32.3).
+  public func requestResumeKey(fileId: Data) async throws -> Data {
+    let request = IOCtl.Request(
+      creditCharge: 1,
+      messageId: messageId.next(),
+      treeId: treeId,
+      sessionId: sessionId,
+      ctlCode: .srvRequestResumeKey,
+      fileId: fileId,
+      input: Data(),
+      output: Data()
+    )
+    let response = try await send(request)
+    guard response.buffer.count >= 24 else { throw CopyChunk.Error.badResponse }
+    return Data(response.buffer.prefix(24))
+  }
+
+  /// FSCTL_SRV_COPYCHUNK: the server copies `chunks` of the file `sourceKey`
+  /// names into the open file `fileId` itself ([MS-SMB2] 2.2.31.1.1).
+  /// Returns the bytes it wrote, which can be fewer than asked for.
+  public func copyChunk(fileId: Data, sourceKey: Data, chunks: [CopyChunk]) async throws -> UInt32 {
+    var input = Data()
+    input += sourceKey
+    input += UInt32(chunks.count)
+    input += UInt32(0)
+    for chunk in chunks {
+      input += chunk.sourceOffset
+      input += chunk.targetOffset
+      input += chunk.length
+      input += UInt32(0)
+    }
+    let request = IOCtl.Request(
+      creditCharge: 1,
+      messageId: messageId.next(),
+      treeId: treeId,
+      sessionId: sessionId,
+      ctlCode: .srvCopyChunk,
+      fileId: fileId,
+      input: input,
+      output: Data()
+    )
+    let response = try await send(request)
+    guard response.buffer.count >= 12 else { throw CopyChunk.Error.badResponse }
+    let reader = ByteReader(response.buffer)
+    let _: UInt32 = reader.read() // ChunksWritten
+    let _: UInt32 = reader.read() // ChunkBytesWritten
+    let total: UInt32 = reader.read()
+    return total
+  }
+
   private func send<Request: Message.Request>(_ message: Request) async throws -> Request.Response {
     let packet = message.encoded()
     let data = try await connection.send(seal(sign(packet)))
@@ -899,10 +950,17 @@ public class Session {
   }
 }
 
-private class SequenceNumber<I: UnsignedInteger & FixedWidthInteger> {
-  var current: I = 0
+/// Message IDs for one connection. Every `Session` made for another share
+/// (`newSession`) shares this counter, and their requests can be made from
+/// different tasks at once, so it's locked: two requests with one ID make
+/// the server drop the connection.
+private final class SequenceNumber<I: UnsignedInteger & FixedWidthInteger> {
+  private var current: I = 0
+  private let lock = NSLock()
 
   func next(count: I = 1) -> I {
+    lock.lock()
+    defer { lock.unlock() }
     let next = current
     current &+= count
     return next
